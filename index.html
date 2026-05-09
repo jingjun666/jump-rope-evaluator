@@ -409,12 +409,14 @@ const canvasCtx = canvasElement.getContext('2d');
 const loadingElement = document.getElementById('loading');
 const scoreFlash = document.getElementById('scoreFlash');
 const calibrateOverlay = document.getElementById('calibrateOverlay');
-const calibrateBtn = document.getElementById('calibrateBtn');
 
 let pose = null;
 let camera = null;
 let isRunning = false;
 let isPaused = false;
+let mediaPipeReady = false;
+let mediaPipeLoadTimeout = null;
+let cameraStarted = false;
 
 // Stats
 let totalJumps = 0;
@@ -489,6 +491,9 @@ async function loadCameras() {
 }
 
 async function startCamera(deviceId) {
+  if (cameraStarted) return; // Prevent double init
+  cameraStarted = true;
+
   if (camera) {
     camera.stop();
     camera = null;
@@ -509,41 +514,79 @@ async function startCamera(deviceId) {
     canvasElement.width = videoElement.videoWidth || 1280;
     canvasElement.height = videoElement.videoHeight || 720;
 
-    // Start pose
+    // Start pose - this now handles its own loading state
     initPose();
   } catch (e) {
+    cameraStarted = false; // Reset so user can try again
     console.error('Camera error:', e);
     document.getElementById('statusBar').textContent = '摄像头启动失败: ' + e.message;
   }
 }
 
 function initPose() {
-  pose = new Pose({
-    locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${f}`
-  });
+  // Set a 15-second timeout for MediaPipe loading
+  mediaPipeLoadTimeout = setTimeout(() => {
+    if (!mediaPipeReady) {
+      loadingElement.innerHTML = `
+        <div style="color:#f87171;font-size:14px;">⚠️ AI模型加载超时</div>
+        <div style="color:rgba(255,255,255,0.6);font-size:12px;margin-top:8px;">
+          可能是网络连接问题<br>
+          1. 检查网络<br>
+          2. 刷新重试<br>
+          3. 或换用Chrome浏览器
+        </div>
+        <button onclick="location.reload()" style="margin-top:12px;padding:8px 16px;background:#e94560;border:none;border-radius:6px;color:#fff;cursor:pointer;">刷新重试</button>
+      `;
+      document.getElementById('statusBar').textContent = '模型加载超时，请检查网络后刷新重试';
+    }
+  }, 15000);
 
-  pose.setOptions({
-    modelComplexity: 1,
-    smoothLandmarks: true,
-    minDetectionConfidence: 0.5,
-    minTrackingConfidence: 0.5
-  });
+  try {
+    pose = new Pose({
+      locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${f}`
+    });
 
-  pose.onResults(onResults);
+    pose.setOptions({
+      modelComplexity: 1,
+      smoothLandmarks: true,
+      minDetectionConfidence: 0.5,
+      minTrackingConfidence: 0.5
+    });
 
-  camera = new Camera(videoElement, {
-    onFrame: async () => {
-      if (!isPaused) {
-        await pose.send({ image: videoElement });
+    pose.onResults(onResults);
+
+    // MediaPipe is loaded when onResults is called for the first time with valid landmarks
+    const originalOnResults = pose.onResults;
+    pose.onResults = function(results) {
+      if (!mediaPipeReady && results.poseLandmarks) {
+        mediaPipeReady = true;
+        clearTimeout(mediaPipeLoadTimeout);
+        loadingElement.classList.add('hidden');
+        document.getElementById('statusBar').textContent = '系统就绪，请先标定跳绳区域';
       }
-    },
-    width: videoElement.videoWidth || 1280,
-    height: videoElement.videoHeight || 720
-  });
+      originalOnResults.call(this, results);
+    };
 
-  camera.start();
-  loadingElement.classList.add('hidden');
-  document.getElementById('statusBar').textContent = '系统就绪，请先标定跳绳区域';
+    camera = new Camera(videoElement, {
+      onFrame: async () => {
+        if (!isPaused) {
+          await pose.send({ image: videoElement });
+        }
+      },
+      width: videoElement.videoWidth || 1280,
+      height: videoElement.videoHeight || 720
+    });
+
+    camera.start();
+  } catch (e) {
+    clearTimeout(mediaPipeLoadTimeout);
+    console.error('Pose init error:', e);
+    loadingElement.innerHTML = `
+      <div style="color:#f87171;font-size:14px;">⚠️ AI模型加载失败</div>
+      <div style="color:rgba(255,255,255,0.6);font-size:12px;margin-top:8px;">${e.message}</div>
+    `;
+    document.getElementById('statusBar').textContent = 'AI模型加载失败: ' + e.message;
+  }
 }
 
 // ============ CALIBRATION ============
@@ -1130,11 +1173,6 @@ canvasElement.addEventListener('click', doCalibrate);
 // ============ INIT ============
 window.onload = async () => {
   await loadCameras();
-  // Try to start default camera
-  const select = document.getElementById('cameraSelect');
-  if (select.options.length > 1) {
-    // Will start after user selects or we auto-select
-  }
 
   // Load voices
   if (synth.onvoiceschanged !== undefined) {
@@ -1142,25 +1180,24 @@ window.onload = async () => {
   }
 
   document.getElementById('statusBar').textContent = '请选择摄像头并标定跳绳区域';
-};
 
-// Auto-start camera if only one available
-navigator.mediaDevices.enumerateDevices().then(devices => {
-  const videoDevices = devices.filter(d => d.kind === 'videoinput');
-  if (videoDevices.length === 1) {
-    startCamera(videoDevices[0].deviceId);
-  } else if (videoDevices.length > 1) {
-    // Auto-select the back/environment camera if available
-    const backCamera = videoDevices.find(d =>
-      d.label.toLowerCase().includes('back') ||
-      d.label.toLowerCase().includes('rear') ||
-      d.label.toLowerCase().includes('environment')
-    );
-    if (backCamera) {
-      startCamera(backCamera.deviceId);
+  // Auto-start camera if only one available (only after user interaction)
+  document.addEventListener('click', async function autoStart() {
+    document.removeEventListener('click', autoStart);
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const videoDevices = devices.filter(d => d.kind === 'videoinput');
+    if (videoDevices.length === 1) {
+      startCamera(videoDevices[0].deviceId);
+    } else if (videoDevices.length > 1) {
+      const backCamera = videoDevices.find(d =>
+        d.label.toLowerCase().includes('back') ||
+        d.label.toLowerCase().includes('rear') ||
+        d.label.toLowerCase().includes('environment')
+      );
+      if (backCamera) startCamera(backCamera.deviceId);
     }
-  }
-});
+  }, { once: true, passive: true });
+};
 </script>
 </body>
 </html>
